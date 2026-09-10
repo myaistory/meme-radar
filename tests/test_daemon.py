@@ -908,7 +908,7 @@ class DaemonTests(unittest.TestCase):
             self.assertEqual(120, daemon.initial_probe_budget.snapshot()["limit"])
             self.assertEqual(60, daemon.size_recheck_budget.snapshot()["limit"])
             self.assertEqual(
-                {"bsc": 80, "base": 30, "robinhood": 10},
+                {"bsc": 120, "base": 120, "robinhood": 120},
                 {
                     chain: budget.snapshot()["limit"]
                     for chain, budget in daemon.initial_chain_budgets.items()

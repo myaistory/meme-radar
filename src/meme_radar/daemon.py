@@ -200,18 +200,16 @@ class RadarDaemon:
         )
         initial_total = max(1, size_capacity * 2 // 3)
         size_recheck_total = max(1, size_capacity - initial_total)
-        bsc_initial = max(1, initial_total * 2 // 3)
-        base_initial = max(1, initial_total // 4)
         initial_limits = {
-            "bsc": bsc_initial,
-            "base": base_initial,
-            "robinhood": max(1, initial_total - bsc_initial - base_initial),
+            "bsc": initial_total,
+            "base": initial_total,
+            "robinhood": initial_total,
         }
         self.initial_chain_budgets = {
             chain: SlidingBudget(limit)
             for chain, limit in initial_limits.items()
         }
-        self.initial_probe_budget = SlidingBudget(sum(initial_limits.values()))
+        self.initial_probe_budget = SlidingBudget(initial_total)
         self.size_recheck_budget = SlidingBudget(size_recheck_total)
         self.dex_recheck_budget = SlidingBudget(
             max(1, settings.enrich_max_per_hour // 4)
