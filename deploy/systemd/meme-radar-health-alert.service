@@ -1,6 +1,6 @@
 [Unit]
 Description=Meme Radar Telegram health alerts
-After=network-online.target meme-radar.service meme-radar-pons-curve-shadow.service
+After=network-online.target meme-radar.service meme-radar-pons-curve-shadow.service meme-radar-outcome-collector.service
 Wants=network-online.target
 
 [Service]
@@ -10,7 +10,7 @@ Group=memeradar
 WorkingDirectory=/opt/meme-radar/current
 Environment=PYTHONPATH=/opt/meme-radar/current/src
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/meme-radar/venv/bin/python -m meme_radar.health_alert --telegram-env /etc/meme-radar/telegram.env --main-health /var/lib/meme-radar/health.json --curve-health /var/lib/meme-radar/pons-curve-shadow/health.json --notifier-health /var/lib/meme-radar/pons-curve-notifier/health.json --state-path /var/lib/meme-radar/health-alert/state.json --health-path /var/lib/meme-radar/health-alert/health.json --poll-seconds 15 --alert-after-seconds 60 --cooldown-seconds 1800
+ExecStart=/opt/meme-radar/venv/bin/python -m meme_radar.health_alert --telegram-env /etc/meme-radar/telegram.env --main-health /var/lib/meme-radar/health.json --curve-health /var/lib/meme-radar/pons-curve-shadow/health.json --notifier-health /var/lib/meme-radar/pons-curve-notifier/health.json --outcome-health /var/lib/meme-radar/outcome-collector/health.json --state-path /var/lib/meme-radar/health-alert/state.json --health-path /var/lib/meme-radar/health-alert/health.json --poll-seconds 15 --alert-after-seconds 60 --cooldown-seconds 1800
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=20

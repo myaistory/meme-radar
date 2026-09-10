@@ -19,6 +19,15 @@ HEALTH_MAX_BYTES = 64 * 1024
 HEALTH_STALE_MS = 60_000
 WSS_IDLE_MS = 120_000
 RECENT_ERROR_MS = 5 * 60_000
+CHECKPOINT_HOLD_MS = 5 * 60_000
+# The outcome collector spends whole cycles waiting on the market provider, so
+# a 60-second staleness rule would fire on a healthy process. It also loses no
+# signal when it stops -- only measurement -- so its thresholds are deliberately
+# looser than the delivery path's.
+OUTCOME_STALE_MS = 10 * 60_000
+OUTCOME_IDLE_MS = 6 * 3_600_000
+OUTCOME_EXPIRED_SHARE = 0.2
+OUTCOME_EXPIRED_MIN = 20
 
 
 def _read_health(path: Path) -> Dict[str, Any]:
@@ -48,6 +57,101 @@ def _recent_rpc_issues(payload: Mapping[str, Any], now_ms: int) -> Dict[str, str
     return issues
 
 
+def _native_chain_issues(
+    chain: str,
+    status: Any,
+    now_ms: int,
+) -> Dict[str, str]:
+    issues: Dict[str, str] = {}
+    state = status if isinstance(status, dict) else {}
+    label = chain.upper()
+    if state.get("connected") is not True:
+        issues["RPC_DISCONNECTED_" + label] = label + " RPC/WSS 已断开"
+    if state.get("slot") == "standby":
+        issues["RPC_FAILOVER_" + label] = (
+            label + " 主节点异常，备用RPC仍在正常采集和推送"
+        )
+    hold = state.get("checkpoint_hold")
+    if isinstance(hold, dict):
+        since = hold.get("since_ms")
+        held_for = now_ms - since if isinstance(since, int) else 0
+        if held_for > CHECKPOINT_HOLD_MS:
+            issues["RPC_CHECKPOINT_STALLED_" + label] = (
+                "%s 区块检查点在 %s 停滞超过%d分钟，事件未落库"
+                % (label, hold.get("block"), CHECKPOINT_HOLD_MS // 60_000)
+            )
+    return issues
+
+
+def _outcome_issues(
+    payload: Optional[Mapping[str, Any]],
+    now_ms: int,
+) -> Dict[str, str]:
+    """Issues for the post-hoc outcome collector.
+
+    Measurement failures degrade the evidence base, not the product, so they are
+    reported as their own codes rather than reusing the delivery-path codes.
+    """
+    issues: Dict[str, str] = {}
+    if payload is None:
+        issues["HEALTH_MISSING_OUTCOME"] = "后验采集 health 不可读取"
+        return issues
+    updated = payload.get("updated_at_ms")
+    if not isinstance(updated, int) or now_ms - updated > OUTCOME_STALE_MS:
+        issues["HEALTH_STALE_OUTCOME"] = "后验采集 health 超过10分钟未更新"
+        return issues
+    # last_error is keyed by stage, matching the other services, so only a
+    # recent entry is reported. A stale one describes a resolved problem.
+    for stage, value in (payload.get("last_error") or {}).items():
+        if not isinstance(value, dict):
+            continue
+        observed = value.get("at_ms")
+        if not isinstance(observed, int) or now_ms - observed > RECENT_ERROR_MS:
+            continue
+        code = str(value.get("code") or "UNKNOWN")
+        issues["OUTCOME_ERROR_%s" % str(stage).upper()] = (
+            "后验采集 %s 阶段出错: %s" % (stage, code)
+        )
+    issues.update(_outcome_capacity_issues(payload))
+    enrolled = payload.get("last_enrolled_at_ms")
+    # A collector that has never enrolled anything is starting up, not idle.
+    if isinstance(enrolled, int) and enrolled > 0:
+        if now_ms - enrolled > OUTCOME_IDLE_MS:
+            issues["OUTCOME_ENROLLMENT_IDLE"] = "后验采集超过6小时没有新入组样本"
+    return issues
+
+
+def _outcome_capacity_issues(payload: Mapping[str, Any]) -> Dict[str, str]:
+    """Provider budget pressure and measurement-window loss."""
+    issues: Dict[str, str] = {}
+    budget = payload.get("provider_budget") or {}
+    cooldown = int(budget.get("cooldown_seconds") or 0)
+    if cooldown > 0:
+        issues["OUTCOME_PROVIDER_COOLDOWN"] = (
+            "后验采集行情源冷却中，剩余 %d 秒" % cooldown
+        )
+    used = int(budget.get("used") or 0)
+    limit = int(budget.get("limit") or 0)
+    if limit > 0 and used >= limit:
+        issues["OUTCOME_BUDGET_EXHAUSTED"] = (
+            "后验采集行情预算已用尽 %d/%d，测量点将被推迟" % (used, limit)
+        )
+    outcomes = payload.get("outcomes") or {}
+    expired = int(outcomes.get("expired") or 0)
+    total = sum(
+        int(outcomes.get(label) or 0)
+        for label in ("ok", "unavailable", "error", "expired")
+    )
+    # A few missed windows are normal. A fifth of all measurement points means
+    # the cohort has holes and its distribution can no longer be trusted.
+    if expired >= OUTCOME_EXPIRED_MIN and total > 0:
+        if expired / total >= OUTCOME_EXPIRED_SHARE:
+            issues["OUTCOME_WINDOWS_MISSED"] = (
+                "后验采集有 %d/%d 个测量点错过时间窗" % (expired, total)
+            )
+    return issues
+
+
 def collect_issues(
     *,
     now_ms: int,
@@ -55,6 +159,8 @@ def collect_issues(
     curve: Optional[Mapping[str, Any]],
     notifier: Optional[Mapping[str, Any]],
     metric_state: Dict[str, Any],
+    outcome: Optional[Mapping[str, Any]] = None,
+    outcome_expected: bool = False,
 ) -> Dict[str, str]:
     issues: Dict[str, str] = {}
     for label, payload in (("MAIN", main), ("CURVE", curve), ("NOTIFIER", notifier)):
@@ -65,18 +171,13 @@ def collect_issues(
         if not isinstance(updated, int) or now_ms - updated > HEALTH_STALE_MS:
             issues["HEALTH_STALE_" + label] = label + " health 超过60秒未更新"
     if main is not None:
-        chains = ((main.get("native_rpc") or {}).get("chains") or {})
-        for chain in ("bsc", "base", "robinhood"):
-            status = chains.get(chain) or {}
-            if status.get("connected") is not True:
-                issues["RPC_DISCONNECTED_" + chain.upper()] = (
-                    chain.upper() + " RPC/WSS 已断开"
-                )
-            if status.get("slot") == "standby":
-                issues["RPC_FAILOVER_" + chain.upper()] = (
-                    chain.upper()
-                    + " 主节点异常，备用RPC仍在正常采集和推送"
-                )
+        native = main.get("native_rpc") or {}
+        chains = native.get("chains") or {}
+        # Only chains the daemon actually configured are checked. A disabled or
+        # demoted chain reports no entry, so it must not raise an alert.
+        if str(native.get("mode") or "off") != "off":
+            for chain in sorted(chains):
+                issues.update(_native_chain_issues(chain, chains[chain], now_ms))
         issues.update(_recent_rpc_issues(main, now_ms))
         if main.get("gmgn_discovery_enabled") is True:
             started = main.get("started_at_ms")
@@ -96,9 +197,15 @@ def collect_issues(
                         "GMGN %s成长候选源超过5分钟没有成功更新"
                         % chain.upper()
                     )
-        pending = int((main.get("telegram_outbox") or {}).get("pending") or 0)
+        outbox = main.get("telegram_outbox") or {}
+        pending = int(outbox.get("pending") or 0)
         if pending > 0:
             issues["MAIN_OUTBOX_PENDING"] = "主推送 outbox 待发送 %d 条" % pending
+        failed = int(outbox.get("failed") or 0)
+        if failed > 0:
+            issues["MAIN_OUTBOX_FAILED"] = (
+                "主推送 outbox 有 %d 条已达最大重试次数并终止" % failed
+            )
     if curve is not None:
         if curve.get("connected") is not True:
             issues["PONS_CURVE_DISCONNECTED"] = "Pons curve 实时采集源已断开"
@@ -117,6 +224,8 @@ def collect_issues(
         pending = int((notifier.get("outbox") or {}).get("pending") or 0)
         if pending > 0:
             issues["PONS_OUTBOX_PENDING"] = "Pons outbox 待发送 %d 条" % pending
+    if outcome_expected:
+        issues.update(_outcome_issues(outcome, now_ms))
     return issues
 
 
@@ -129,6 +238,7 @@ class HealthAlerter:
         curve_health: Path,
         notifier_health: Path,
         state_path: Path,
+        outcome_health: Optional[Path] = None,
         health_path: Path,
         poll_seconds: int,
         alert_after_seconds: int,
@@ -152,6 +262,11 @@ class HealthAlerter:
             "curve": curve_health,
             "notifier": notifier_health,
         }
+        # Unconfigured means not deployed, which must not alert. Only a
+        # configured collector is held to a staleness contract.
+        self.outcome_expected = outcome_health is not None
+        if outcome_health is not None:
+            self.paths["outcome"] = outcome_health
         self.state_path = state_path
         self.health_path = health_path
         self.poll_seconds = poll_seconds
@@ -201,7 +316,13 @@ class HealthAlerter:
             except (OSError, ValueError, json.JSONDecodeError):
                 payloads[label] = None
         metrics = self.state.setdefault("metrics", {})
-        current = collect_issues(now_ms=now_ms, metric_state=metrics, **payloads)
+        payloads.setdefault("outcome", None)
+        current = collect_issues(
+            now_ms=now_ms,
+            metric_state=metrics,
+            outcome_expected=self.outcome_expected,
+            **payloads,
+        )
         known = self.state.setdefault("issues", {})
         for code, summary in current.items():
             issue = known.setdefault(
@@ -269,6 +390,7 @@ def arguments():
     parser.add_argument("--main-health", type=Path, required=True)
     parser.add_argument("--curve-health", type=Path, required=True)
     parser.add_argument("--notifier-health", type=Path, required=True)
+    parser.add_argument("--outcome-health", type=Path, default=None)
     parser.add_argument("--state-path", type=Path, required=True)
     parser.add_argument("--health-path", type=Path, required=True)
     parser.add_argument("--poll-seconds", type=int, default=15)
@@ -294,6 +416,7 @@ async def async_main(args) -> int:
         main_health=args.main_health,
         curve_health=args.curve_health,
         notifier_health=args.notifier_health,
+        outcome_health=args.outcome_health,
         state_path=args.state_path,
         health_path=args.health_path,
         poll_seconds=args.poll_seconds,

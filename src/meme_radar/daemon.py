@@ -23,6 +23,7 @@ from .evm_rpc import (
     NATIVE_SPECS,
     RpcError,
     get_logs_with_413_split,
+    native_log_block_number,
     parse_log_identity,
     parse_native_launch,
     probe_native_wss_once,
@@ -55,7 +56,9 @@ from .storage import (
     claim_due_telegram,
     claim_due_enrichment,
     connect,
+    enrichment_queue_under_pressure,
     enrichment_job_counts,
+    EventIdentityConflict,
     enqueue_telegram,
     enqueue_observation_sample,
     finish_enrichment_job,
@@ -188,16 +191,31 @@ class RadarDaemon:
         self.gmgn_discovery_budget = SlidingBudget(
             settings.gmgn_discovery_max_per_hour
         )
+        self.gmgn_call_lock = asyncio.Lock()
+        self.gmgn_next_call_at = 0.0
+        size_capacity = (
+            settings.gmgn_max_per_hour
+            if settings.gmgn_enabled
+            else settings.enrich_max_per_hour
+        )
+        initial_total = max(1, size_capacity * 2 // 3)
+        size_recheck_total = max(1, size_capacity - initial_total)
+        bsc_initial = max(1, initial_total * 2 // 3)
+        base_initial = max(1, initial_total // 4)
         initial_limits = {
-            "bsc": max(4, settings.enrich_max_per_hour // 4),
-            "base": max(2, settings.enrich_max_per_hour // 8),
-            "robinhood": 4,
+            "bsc": bsc_initial,
+            "base": base_initial,
+            "robinhood": max(1, initial_total - bsc_initial - base_initial),
         }
         self.initial_chain_budgets = {
             chain: SlidingBudget(limit)
             for chain, limit in initial_limits.items()
         }
         self.initial_probe_budget = SlidingBudget(sum(initial_limits.values()))
+        self.size_recheck_budget = SlidingBudget(size_recheck_total)
+        self.dex_recheck_budget = SlidingBudget(
+            max(1, settings.enrich_max_per_hour // 4)
+        )
         self.telegram_budget = SlidingBudget(settings.telegram_max_per_hour)
         self.counters: Counter = Counter()
         self.last_success: Dict[str, int] = {}
@@ -282,6 +300,7 @@ class RadarDaemon:
                 chat_id=credentials.telegram_chat_id,
                 topic_id=credentials.telegram_topic_id,
             )
+
         tokens = []
         if settings.bitquery_enabled:
             tokens.append(credentials.bitquery_token)
@@ -324,6 +343,7 @@ class RadarDaemon:
         self.native_block_times: Dict[tuple, int] = {}
         self.native_reconnect_events: Dict[str, asyncio.Event] = {}
         self.native_primary_probe_successes: Dict[str, int] = {}
+        self.native_checkpoint_hold: Dict[str, Dict[str, int]] = {}
         if settings.native_rpc_mode != "off":
             configured = {
                 "bsc": (
@@ -376,6 +396,21 @@ class RadarDaemon:
                 self.native_connected[chain] = False
                 self.native_reconnect_events[chain] = asyncio.Event()
                 self.native_primary_probe_successes[chain] = 0
+                self.native_checkpoint_hold.pop(chain, None)
+
+    async def run_gmgn_call(self, function, *args):
+        async with self.gmgn_call_lock:
+            delay = self.gmgn_next_call_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                return await asyncio.to_thread(function, *args)
+            finally:
+                self.gmgn_next_call_at = time.monotonic() + 3.0
+
+    def cooldown_all_gmgn(self, seconds: float) -> None:
+        self.gmgn_budget.cooldown(seconds)
+        self.gmgn_discovery_budget.cooldown(seconds)
 
     def close(self) -> None:
         self.connection.close()
@@ -516,6 +551,22 @@ class RadarDaemon:
         features: FeatureSnapshot,
     ) -> None:
         priority = self.priority_tracker.score(event, features)
+        queue_under_pressure = enrichment_queue_under_pressure(self.connection)
+        if queue_under_pressure and priority.score < 35:
+            self.counters["priority_admission_low"] += 1
+            return
+        has_narrative_signal = any(
+            reason.startswith("NARRATIVE_BURST_") or reason == "CROSS_CHAIN_10"
+            for reason in priority.reason_codes
+        )
+        if (
+            priority.score < 60
+            and event.source != GMGN_TRENDING_SOURCE
+            and not has_narrative_signal
+            and queue_under_pressure
+        ):
+            self.counters["priority_admission_pressure"] += 1
+            return
         created_at_ms = event.token_created_at_ms or event.received_at_ms
         growth_source = event.source == GMGN_TRENDING_SOURCE
         earliest_due_ms = (
@@ -549,9 +600,7 @@ class RadarDaemon:
             expires_at_ms=expires_at_ms,
         ):
             self.counters["priority_scheduled"] += 1
-            band = "high" if priority.score >= 70 else "medium"
-            if priority.score < 50:
-                band = "low"
+            band = "high" if priority.score >= 60 else "medium"
             self.counters["priority_" + band] += 1
 
     def process_batch(
@@ -613,6 +662,32 @@ class RadarDaemon:
     def native_checkpoint_key(self, chain: str) -> str:
         return "native_rpc_checkpoint:" + chain
 
+    def hold_native_checkpoint(self, chain: str, block_number: int) -> None:
+        """Stop advancing ``chain``'s checkpoint at an unprocessed block.
+
+        The checkpoint means "every log below this block is durably stored", so
+        it must not move past a log that failed processing. Holding stalls the
+        chain instead of silently dropping the event; the hold is reported in
+        health so the alert sidecar can escalate it.
+        """
+        now_ms = int(time.time() * 1000)
+        held = self.native_checkpoint_hold.get(chain)
+        if held is not None and int(held["block"]) <= block_number:
+            held["holds"] = int(held["holds"]) + 1
+            held["updated_at_ms"] = now_ms
+        else:
+            self.native_checkpoint_hold[chain] = {
+                "block": int(block_number),
+                "holds": 1,
+                "since_ms": now_ms,
+                "updated_at_ms": now_ms,
+            }
+        self.counters["native_rpc_%s_checkpoint_held" % chain] += 1
+
+    def release_native_checkpoint(self, chain: str) -> None:
+        if self.native_checkpoint_hold.pop(chain, None) is not None:
+            self.counters["native_rpc_%s_checkpoint_released" % chain] += 1
+
     async def native_block_timestamp(self, chain: str, block_number: int) -> int:
         key = (chain, block_number)
         if key in self.native_block_times:
@@ -636,6 +711,13 @@ class RadarDaemon:
             self.native_block_times.pop(next(iter(self.native_block_times)))
         return value
 
+    def record_token_metadata_error(self, field: str, error_type: str) -> None:
+        self.counters["native_token_metadata_error_" + field] += 1
+        self.last_error["native_token_metadata_" + field] = {
+            "at_ms": int(time.time() * 1000),
+            "type": error_type,
+        }
+
     async def process_native_log(
         self,
         chain: str,
@@ -656,6 +738,7 @@ class RadarDaemon:
             name, symbol = await asyncio.to_thread(
                 client.token_metadata,
                 identity.token_address,
+                self.record_token_metadata_error,
             )
         received_at_ms = int(time.time() * 1000)
         batch = parse_native_launch(
@@ -693,6 +776,12 @@ class RadarDaemon:
         *,
         is_backfill: bool,
     ) -> bool:
+        """Report whether this log is durably stored, not whether it was new.
+
+        The checkpoint may only advance over logs that are stored, so this
+        answers exactly that question. A duplicate that storage already holds
+        counts as stored; only a genuine persistence failure does not.
+        """
         try:
             await self.process_native_log(
                 chain,
@@ -702,6 +791,14 @@ class RadarDaemon:
             return True
         except RpcError:
             raise
+        except EventIdentityConflict:
+            # One launch reaches us from both the live stream and backfill, and
+            # only the live path fetches name and symbol, so the two renderings
+            # of the same log differ and storage refuses the second one. The
+            # event is already stored, so stalling the chain here would strand
+            # a healthy checkpoint on a duplicate. Counted, not held.
+            self.counters["native_rpc_%s_identity_conflict" % chain] += 1
+            return True
         except (RuntimeError, ValueError, sqlite3.Error) as exc:
             self.record_error("native_processing_" + chain, exc)
             self.counters["native_rpc_%s_processing_rejected" % chain] += 1
@@ -743,13 +840,25 @@ class RadarDaemon:
                 upper,
             )
             self.counters["native_rpc_%s_backfill_413_splits" % chain] += split_count
+            blocked_at = None
             for log in logs:
-                await self.process_native_log_safe(
+                processed = await self.process_native_log_safe(
                     chain,
                     log,
                     is_backfill=True,
                 )
+                if processed:
+                    continue
+                failed_at = native_log_block_number(log)
+                failed_at = lower if failed_at is None else failed_at
+                blocked_at = (
+                    failed_at if blocked_at is None else min(blocked_at, failed_at)
+                )
             self.counters["native_rpc_%s_backfill_calls" % chain] += 1
+            if blocked_at is not None:
+                self.hold_native_checkpoint(chain, blocked_at)
+                return
+        self.release_native_checkpoint(chain)
         set_runtime_state(
             self.connection,
             self.native_checkpoint_key(chain),
@@ -792,17 +901,23 @@ class RadarDaemon:
                         self.counters["native_rpc_%s_removed" % chain] += 1
                         continue
                     identity = parse_log_identity(log, NATIVE_SPECS[chain])
-                    await self.process_native_log_safe(
+                    processed = await self.process_native_log_safe(
                         chain,
                         log,
                         is_backfill=False,
                     )
-                    set_runtime_state(
-                        self.connection,
-                        self.native_checkpoint_key(chain),
-                        identity.block_number,
-                        int(time.time() * 1000),
-                    )
+                    if not processed:
+                        self.hold_native_checkpoint(
+                            chain,
+                            identity.block_number,
+                        )
+                    elif chain not in self.native_checkpoint_hold:
+                        set_runtime_state(
+                            self.connection,
+                            self.native_checkpoint_key(chain),
+                            identity.block_number,
+                            int(time.time() * 1000),
+                        )
                     self.native_consecutive_errors[chain] = 0
                     self.last_success["native_rpc_%s_log" % chain] = int(
                         time.time() * 1000
@@ -1101,7 +1216,7 @@ class RadarDaemon:
                     self.counters["gmgn_discovery_budget_blocked"] += 1
                     break
                 try:
-                    result = await asyncio.to_thread(
+                    result = await self.run_gmgn_call(
                         self.gmgn_discovery.fetch,
                         chain,
                     )
@@ -1122,15 +1237,15 @@ class RadarDaemon:
                 except GmgnCliError as exc:
                     self.record_error("gmgn_discovery_" + chain, exc)
                     if exc.status == 429:
-                        self.gmgn_discovery_budget.cooldown(300)
+                        self.cooldown_all_gmgn(300)
                         self.counters["gmgn_discovery_429_cooldown"] += 1
                         break
                     elif exc.status in {401, 403}:
-                        self.gmgn_discovery_budget.cooldown(1800)
+                        self.cooldown_all_gmgn(1800)
                         self.counters["gmgn_discovery_auth_cooldown"] += 1
                         break
                     elif exc.code.startswith("CONFIG_CHECK"):
-                        self.gmgn_discovery_budget.cooldown(1800)
+                        self.cooldown_all_gmgn(1800)
                         self.counters["gmgn_discovery_config_cooldown"] += 1
                         break
                     self.counters["gmgn_discovery_chain_errors"] += 1
@@ -1304,9 +1419,27 @@ class RadarDaemon:
         ).fetchone()
         return row is not None
 
-    def next_size_check_ms(self, event: RadarEvent, now_ms: int) -> Optional[int]:
+    def next_size_check_ms(
+        self,
+        event: RadarEvent,
+        now_ms: int,
+        snapshot: Optional[GmgnTokenInfoSnapshot] = None,
+    ) -> Optional[int]:
         anchor = event.token_created_at_ms or event.received_at_ms
-        for offset in self.config.size_recheck_ms:
+        offsets = self.config.size_recheck_ms
+        if snapshot is not None:
+            cap = snapshot.market_cap_usd
+            holders = snapshot.holder_count
+            if cap is not None and holders is not None:
+                if cap < 20_000 and holders < 20:
+                    offsets = ()
+                elif cap < 60_000 and holders < 60:
+                    offsets = tuple(
+                        offset
+                        for offset in offsets
+                        if 10 * 60_000 <= offset <= 20 * 60_000
+                    )
+        for offset in offsets:
             due_at_ms = anchor + offset
             if due_at_ms > now_ms:
                 return due_at_ms
@@ -1317,8 +1450,9 @@ class RadarDaemon:
         job: Dict[str, Any],
         now_ms: int,
         final_code: str,
+        snapshot: Optional[GmgnTokenInfoSnapshot] = None,
     ) -> None:
-        due_at_ms = self.next_size_check_ms(job["event"], now_ms)
+        due_at_ms = self.next_size_check_ms(job["event"], now_ms, snapshot)
         if due_at_ms is None:
             self.finish_job(job, final_code, now_ms)
             return
@@ -1358,7 +1492,7 @@ class RadarDaemon:
                 )
                 return None
         try:
-            snapshot = await asyncio.to_thread(
+            snapshot = await self.run_gmgn_call(
                 self.gmgn_info.token_info,
                 event.chain,
                 event.token_address,
@@ -1366,7 +1500,7 @@ class RadarDaemon:
         except (GmgnCliError, OSError, ValueError) as exc:
             self.provider_failure(event, "gmgn_size", exc)
             if isinstance(exc, GmgnCliError) and exc.status == 429:
-                self.gmgn_budget.cooldown(300)
+                self.cooldown_all_gmgn(300)
             self.reschedule_size_check(job, now_ms, "GMGN_SIZE_ERROR")
             return None
         if snapshot is None:
@@ -1391,7 +1525,12 @@ class RadarDaemon:
         if reasons:
             for reason in reasons:
                 self.counters["size_" + reason] += 1
-            self.reschedule_size_check(job, now_ms, "MARKET_SIZE_BLOCKED")
+            self.reschedule_size_check(
+                job,
+                now_ms,
+                "MARKET_SIZE_BLOCKED",
+                snapshot,
+            )
             return None
         self.counters["market_size_pass"] += 1
         return snapshot
@@ -1439,7 +1578,8 @@ class RadarDaemon:
             self.finish_job(job, "GMGN_SIZE_STATE_MISSING", now_ms)
             return
         if job["stage"] == "dex_probe":
-            if not self.has_gmgn_size_attempt(event):
+            has_size_attempt = self.has_gmgn_size_attempt(event)
+            if not has_size_attempt:
                 chain_budget = self.initial_chain_budgets[event.chain]
                 if (
                     not self.initial_probe_budget.take()
@@ -1454,6 +1594,16 @@ class RadarDaemon:
                         security_attempts=int(job["security_attempts"]),
                     )
                     return
+            elif not self.size_recheck_budget.take():
+                self.counters["size_recheck_budget_deferred"] += 1
+                self.reschedule_job(
+                    job,
+                    stage="dex_probe",
+                    due_at_ms=now_ms + 30_000,
+                    dex_attempts=int(job["dex_attempts"]),
+                    security_attempts=int(job["security_attempts"]),
+                )
+                return
             if (
                 self.gmgn_info is not None
                 and event.source != GMGN_TRENDING_SOURCE
@@ -1479,6 +1629,20 @@ class RadarDaemon:
                         now_ms,
                     )
                     return
+        if (
+            job["stage"] == "dex_recheck"
+            and not self.dex_recheck_budget.take()
+        ):
+            self.counters["dex_recheck_budget_deferred"] += 1
+            self.reschedule_job(
+                job,
+                stage="dex_recheck",
+                due_at_ms=now_ms + 30_000,
+                dex_attempts=int(job["dex_attempts"]),
+                security_attempts=int(job["security_attempts"]),
+                market=json.loads(job["market_json"] or "null"),
+            )
+            return
         if not self.dex_budget.take():
             self.counters["dex_budget_deferred"] += 1
             self.reschedule_job(
@@ -1967,7 +2131,7 @@ class RadarDaemon:
                 self.counters["gmgn_budget_deferred"] += 1
                 return []
         try:
-            snapshot = await asyncio.to_thread(
+            snapshot = await self.run_gmgn_call(
                 self.gmgn.token_safety,
                 event.chain,
                 event.token_address,
@@ -1975,10 +2139,10 @@ class RadarDaemon:
         except GmgnCliError as exc:
             self.provider_failure(event, "gmgn", exc)
             if exc.status == 429:
-                self.gmgn_budget.cooldown(300)
+                self.cooldown_all_gmgn(300)
                 self.counters["gmgn_429_cooldown"] += 1
             elif exc.status in {401, 403}:
-                self.gmgn_budget.cooldown(1800)
+                self.cooldown_all_gmgn(1800)
                 self.counters["gmgn_auth_cooldown"] += 1
             return []
         if snapshot is None:
@@ -2287,8 +2451,16 @@ class RadarDaemon:
             job = claim_due_enrichment(
                 self.connection,
                 now_ms=now_ms,
-                initial_available=self.initial_probe_budget.available(),
+                initial_available=(
+                    self.initial_probe_budget.available()
+                    and self.gmgn_budget.available()
+                ),
                 initial_chains=initial_chains,
+                size_recheck_available=(
+                    self.size_recheck_budget.available()
+                    and self.gmgn_budget.available()
+                ),
+                dex_recheck_available=self.dex_recheck_budget.available(),
                 dex_available=self.dex_budget.available(),
                 goplus_available=self.goplus_budget.available(),
             )
@@ -2397,6 +2569,7 @@ class RadarDaemon:
                         "primary_probe_successes": self.native_primary_probe_successes.get(
                             chain, 0
                         ),
+                        "checkpoint_hold": self.native_checkpoint_hold.get(chain),
                     }
                     for chain in sorted(self.native_endpoints)
                 },
@@ -2412,6 +2585,8 @@ class RadarDaemon:
                 "gmgn": self.gmgn_budget.snapshot(),
                 "gmgn_discovery": self.gmgn_discovery_budget.snapshot(),
                 "initial_candidates": self.initial_probe_budget.snapshot(),
+                "size_rechecks": self.size_recheck_budget.snapshot(),
+                "dex_rechecks": self.dex_recheck_budget.snapshot(),
                 "initial_by_chain": {
                     chain: budget.snapshot()
                     for chain, budget in sorted(self.initial_chain_budgets.items())

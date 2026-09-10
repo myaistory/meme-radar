@@ -216,6 +216,20 @@ def parse_log_identity(log: Dict[str, Any], spec: NativeLaunchSpec) -> NativeLog
     )
 
 
+def native_log_block_number(log: Any) -> Optional[int]:
+    """Block number of a raw log, or ``None`` when it cannot be parsed.
+
+    Used by checkpoint bookkeeping, which must be able to locate a log that
+    failed processing even when the log itself is malformed.
+    """
+    if not isinstance(log, dict):
+        return None
+    try:
+        return _hex_int(log.get("blockNumber"))
+    except RpcError:
+        return None
+
+
 def parse_native_launch(
     log: Dict[str, Any],
     spec: NativeLaunchSpec,
@@ -456,19 +470,32 @@ class HttpRpcClient:
             raise RpcError("INVALID_LOG_RESULT")
         return [item for item in result if isinstance(item, dict)]
 
-    def token_metadata(self, token_address: str) -> Tuple[str, str]:
+    def token_metadata(
+        self,
+        token_address: str,
+        on_error: Optional[Callable[[str, str], None]] = None,
+    ) -> Tuple[str, str]:
+        """Best-effort ERC-20 name and symbol.
+
+        Missing metadata is not fatal for discovery, so a failed call yields an
+        empty string. ``on_error`` receives ``(field, error_type)`` so callers
+        can count the failure instead of losing it silently.
+        """
         if not _ADDRESS.fullmatch(token_address):
             raise ValueError("invalid token address")
         values = []
-        for selector, limit in (("0x06fdde03", 120), ("0x95d89b41", 32)):
+        fields = (("name", "0x06fdde03", 120), ("symbol", "0x95d89b41", 32))
+        for field, selector, limit in fields:
             try:
                 result = self.call(
                     "eth_call",
                     [{"to": token_address, "data": selector}, "latest"],
                 )
                 values.append(decode_abi_text(result, limit))
-            except (RpcError, ValueError, UnicodeDecodeError):
+            except (RpcError, ValueError, UnicodeDecodeError) as exc:
                 values.append("")
+                if on_error is not None:
+                    on_error(field, type(exc).__name__)
         return values[0], values[1]
 
 

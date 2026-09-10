@@ -8,6 +8,7 @@ from meme_radar.adapters import parse_fourmeme
 from meme_radar.models import FeatureSnapshot
 from meme_radar.replay import replay, replay_digest
 from meme_radar.storage import (
+    EventIdentityConflict,
     claim_due_enrichment,
     claim_due_telegram,
     connect,
@@ -15,6 +16,7 @@ from meme_radar.storage import (
     enqueue_observation_sample,
     finish_enrichment_job,
     initialize,
+    mark_telegram_failed,
     mark_telegram_retry,
     mark_telegram_sent,
     reschedule_enrichment_job,
@@ -26,6 +28,8 @@ from meme_radar.storage import (
     set_runtime_state,
     store_raw_payload,
     telegram_outbox_counts,
+    TELEGRAM_OUTBOX_SCHEMA,
+    _migrate_telegram_outbox_terminal_state,
 )
 
 from support import load_fixture
@@ -151,6 +155,38 @@ class StorageReplayTests(unittest.TestCase):
                         raw_sha256="f" * 64,
                     ),
                 )
+            connection.close()
+
+    def test_a_name_only_difference_raises_the_identity_conflict_type(self):
+        """This is the production shape of the conflict: one launch reaches the
+        radar from both the live stream and backfill, and only the live path
+        fetches name and symbol. The caller has to tell that apart from a
+        failure to store anything, so it needs its own type."""
+        with tempfile.TemporaryDirectory() as temp:
+            connection = connect(Path(temp) / "radar.db")
+            initialize(connection)
+            store_raw_payload(
+                connection,
+                source="native_rpc",
+                batch_id="bsc:0xabc:1:%d" % RECEIVED,
+                observed_at_ms=OBSERVED,
+                received_at_ms=RECEIVED,
+                is_backfill=True,
+                payload=self.payload,
+            )
+            unnamed = replace(self.batch.events[0], name="", symbol="")
+            self.assertTrue(store_event(connection, unnamed))
+            with self.assertRaises(EventIdentityConflict):
+                store_event(connection, self.batch.events[0])
+            # The stored row stays authoritative, so the log is still durably
+            # persisted -- exactly what lets the checkpoint move past it.
+            self.assertEqual(
+                1,
+                connection.execute(
+                    "SELECT COUNT(*) FROM radar_events"
+                ).fetchone()[0],
+            )
+            self.assertTrue(issubclass(EventIdentityConflict, RuntimeError))
             connection.close()
 
     def test_new_database_is_mode_0600(self):
@@ -295,6 +331,14 @@ class StorageReplayTests(unittest.TestCase):
                 now_ms=RECEIVED + 1001,
                 last_error="NOT_COVERED",
             )
+            self.assertIsNone(
+                claim_due_enrichment(
+                    connection,
+                    now_ms=RECEIVED + 2000,
+                    initial_available=False,
+                    dex_recheck_available=False,
+                )
+            )
             claimed = claim_due_enrichment(
                 connection,
                 now_ms=RECEIVED + 2000,
@@ -317,6 +361,239 @@ class StorageReplayTests(unittest.TestCase):
                 (processing["event_id"],),
             ).fetchone()
             self.assertEqual(("pending", "RECOVERED_AFTER_RESTART"), tuple(state))
+            connection.close()
+
+    def test_active_token_jobs_coalesce_and_inherit_higher_priority(self):
+        with tempfile.TemporaryDirectory() as temp:
+            connection = connect(Path(temp) / "radar.db")
+            initialize(connection)
+            store_raw_payload(
+                connection,
+                source="bitquery",
+                batch_id="coalesce",
+                observed_at_ms=OBSERVED,
+                received_at_ms=RECEIVED,
+                is_backfill=False,
+                payload=self.payload,
+            )
+            first = self.batch.events[0]
+            second = replace(
+                first,
+                event_id="e" * 64,
+                source_event_id=first.source_event_id + ":duplicate",
+            )
+            store_event(connection, first)
+            store_event(connection, second)
+            self.assertTrue(
+                schedule_enrichment_job(
+                    connection,
+                    event=first,
+                    features=FeatureSnapshot(
+                        event_id=first.event_id,
+                        evaluated_at_ms=RECEIVED,
+                    ),
+                    priority_version="priority_v1",
+                    priority_score=40,
+                    priority_reasons=("LOWER",),
+                    due_at_ms=RECEIVED + 1000,
+                    expires_at_ms=RECEIVED + 600_000,
+                )
+            )
+            self.assertTrue(
+                schedule_enrichment_job(
+                    connection,
+                    event=second,
+                    features=FeatureSnapshot(
+                        event_id=second.event_id,
+                        evaluated_at_ms=RECEIVED,
+                    ),
+                    priority_version="priority_v1",
+                    priority_score=80,
+                    priority_reasons=("HIGHER",),
+                    due_at_ms=RECEIVED + 500,
+                    expires_at_ms=RECEIVED + 900_000,
+                )
+            )
+            rows = connection.execute(
+                "SELECT event_id,priority_score,due_at_ms,expires_at_ms,"
+                "state,result_code FROM enrichment_jobs ORDER BY created_at_ms,event_id"
+            ).fetchall()
+            self.assertEqual(2, len(rows))
+            self.assertEqual(
+                ("done", "TOKEN_COALESCED"),
+                (rows[0][4], rows[0][5]),
+            )
+            self.assertEqual(
+                (
+                    second.event_id,
+                    80,
+                    RECEIVED + 500,
+                    RECEIVED + 900_000,
+                    "pending",
+                    None,
+                ),
+                tuple(rows[1]),
+            )
+            connection.close()
+
+    def _strong_outbox_row(self, connection):
+        store_raw_payload(
+            connection,
+            source="bitquery",
+            batch_id="fixture",
+            observed_at_ms=OBSERVED,
+            received_at_ms=RECEIVED,
+            is_backfill=False,
+            payload=self.payload,
+        )
+        event = self.batch.events[0]
+        store_event(connection, event)
+        decision = replace(
+            replay((event,))[0],
+            evaluated_at_ms=RECEIVED + 1,
+            risk_verdict="pass",
+            confidence_score=90,
+            opportunity_score=80,
+            delivery="strong",
+        )
+        store_decision(connection, decision)
+        self.assertTrue(
+            enqueue_telegram(
+                connection,
+                decision=decision,
+                dedupe_key="radar_v1:bsc:token",
+                message_text="test",
+                now_ms=RECEIVED + 2,
+            )
+        )
+        return decision
+
+    def test_exhausted_outbox_items_reach_a_terminal_failed_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            connection = connect(Path(temp) / "radar.db")
+            initialize(connection)
+            self._strong_outbox_row(connection)
+            now = RECEIVED + 10
+            for attempt in range(2):
+                item = claim_due_telegram(
+                    connection,
+                    now_ms=now,
+                    max_attempts=2,
+                )
+                self.assertIsNotNone(item)
+                now += 60_000
+                mark_telegram_retry(
+                    connection,
+                    item,
+                    next_attempt_at_ms=now,
+                    error_code="NETWORK_ERROR",
+                )
+            self.assertIsNone(
+                claim_due_telegram(
+                    connection,
+                    now_ms=now + 1,
+                    max_attempts=2,
+                )
+            )
+            self.assertEqual(
+                {"pending": 0, "sent": 0, "failed": 1},
+                telegram_outbox_counts(connection),
+            )
+            row = connection.execute(
+                "SELECT state, last_error, failed_at_ms FROM telegram_outbox"
+            ).fetchone()
+            self.assertEqual("failed", row["state"])
+            self.assertEqual("NETWORK_ERROR", row["last_error"])
+            self.assertEqual(now + 1, row["failed_at_ms"])
+            connection.close()
+
+    def test_permanent_outbox_failure_can_be_recorded_directly(self):
+        with tempfile.TemporaryDirectory() as temp:
+            connection = connect(Path(temp) / "radar.db")
+            initialize(connection)
+            self._strong_outbox_row(connection)
+            item = claim_due_telegram(
+                connection,
+                now_ms=RECEIVED + 10,
+                max_attempts=5,
+            )
+            mark_telegram_failed(
+                connection,
+                item,
+                failed_at_ms=RECEIVED + 11,
+                error_code="MESSAGE_REJECTED",
+            )
+            self.assertEqual(
+                {"pending": 0, "sent": 0, "failed": 1},
+                telegram_outbox_counts(connection),
+            )
+            with self.assertRaises(RuntimeError):
+                mark_telegram_failed(
+                    connection,
+                    item,
+                    failed_at_ms=RECEIVED + 12,
+                    error_code="MESSAGE_REJECTED",
+                )
+            connection.close()
+
+    def test_existing_two_state_outbox_is_migrated_in_place(self):
+        with tempfile.TemporaryDirectory() as temp:
+            connection = connect(Path(temp) / "radar.db")
+            initialize(connection)
+            self._strong_outbox_row(connection)
+            # Rebuild the pre-migration table shape and confirm the migration
+            # widens the CHECK constraint without losing rows.
+            connection.execute("PRAGMA foreign_keys = OFF")
+            with connection:
+                connection.execute(
+                    "CREATE TABLE legacy AS SELECT * FROM telegram_outbox"
+                )
+                connection.execute("DROP TABLE telegram_outbox")
+                connection.executescript(
+                    TELEGRAM_OUTBOX_SCHEMA.replace(
+                        "'pending','sent','failed'",
+                        "'pending','sent'",
+                    ).replace("    failed_at_ms INTEGER,\n", "")
+                )
+                connection.execute(
+                    "INSERT INTO telegram_outbox (event_id, ruleset_version, "
+                    "feature_version, evaluated_at_ms, state, attempts, "
+                    "next_attempt_at_ms, last_error, message_text, sent_at_ms) "
+                    "SELECT event_id, ruleset_version, feature_version, "
+                    "evaluated_at_ms, state, attempts, next_attempt_at_ms, "
+                    "last_error, message_text, sent_at_ms FROM legacy"
+                )
+                connection.execute("DROP TABLE legacy")
+            connection.execute("PRAGMA foreign_keys = ON")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE telegram_outbox SET state='failed'"
+                )
+            self.assertTrue(
+                _migrate_telegram_outbox_terminal_state(connection)
+            )
+            self.assertFalse(
+                _migrate_telegram_outbox_terminal_state(connection)
+            )
+            self.assertEqual(
+                {"pending": 1, "sent": 0, "failed": 0},
+                telegram_outbox_counts(connection),
+            )
+            item = claim_due_telegram(
+                connection,
+                now_ms=RECEIVED + 10,
+                max_attempts=5,
+            )
+            mark_telegram_failed(
+                connection,
+                item,
+                failed_at_ms=RECEIVED + 11,
+                error_code="MESSAGE_REJECTED",
+            )
+            self.assertEqual(
+                {"pending": 0, "sent": 0, "failed": 1},
+                telegram_outbox_counts(connection),
+            )
             connection.close()
 
     def test_telegram_outbox_is_deduplicated_and_retryable(self):
@@ -387,7 +664,7 @@ class StorageReplayTests(unittest.TestCase):
             )
             mark_telegram_sent(connection, item, sent_at_ms=RECEIVED + 10_001)
             self.assertEqual(
-                {"pending": 0, "sent": 1},
+                {"pending": 0, "sent": 1, "failed": 0},
                 telegram_outbox_counts(connection),
             )
             connection.close()

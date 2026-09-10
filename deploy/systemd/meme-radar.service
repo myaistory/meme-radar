@@ -17,7 +17,7 @@ Environment=MEME_RADAR_DB_PATH=/var/lib/meme-radar/radar.db
 Environment=MEME_RADAR_HEALTH_PATH=/var/lib/meme-radar/health.json
 Environment=MEME_RADAR_FOMO_POLL_SECONDS=300
 Environment=MEME_RADAR_CLANKER_POLL_SECONDS=60
-Environment=MEME_RADAR_ENRICH_MAX_PER_HOUR=120
+Environment=MEME_RADAR_ENRICH_MAX_PER_HOUR=300
 Environment=MEME_RADAR_BACKFILL_MAX_MINUTES=10
 ExecStart=/opt/meme-radar/venv/bin/python -m meme_radar.daemon --env-file /etc/meme-radar/radar.env --db-path /var/lib/meme-radar/radar.db --health-path /var/lib/meme-radar/health.json
 Restart=on-failure

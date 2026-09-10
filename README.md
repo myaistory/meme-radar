@@ -63,6 +63,8 @@ Telegram 默认关闭。请先使用隔离数据库做 DRY_RUN，再考虑服务
 - [数据源与故障转移](docs/DATA_SOURCES.md)
 - [部署指南](docs/DEPLOYMENT.md)
 - [运行与告警](docs/OPERATIONS.md)
+- [补全吞吐设计](docs/ENRICHMENT_THROUGHPUT.md)
+- [后验效果评估](docs/OUTCOME_EVALUATION.md)
 - [安全模型](docs/SECURITY.md)
 - [仓库公开范围](docs/REPOSITORY_SCOPE.md)
 

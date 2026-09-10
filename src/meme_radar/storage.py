@@ -9,9 +9,43 @@ from .models import Decision, FeatureSnapshot, RadarEvent
 from .normalize import canonical_json, payload_sha256
 
 
-# enrichment_jobs is an additive extension. Keep v4 so the current rollback
-# release can reopen the database and safely ignore the extra table.
+# enrichment_jobs and the telegram_outbox terminal state are additive
+# extensions. Keep v4 so the current rollback release can reopen the database:
+# it ignores the extra table, and it never writes the extra state, so a
+# database migrated here stays readable by the previous release.
 SCHEMA_VERSION = 4
+
+
+class EventIdentityConflict(RuntimeError):
+    """An event with this identity is stored already, with different content.
+
+    The stored row stays authoritative, so the source log *is* durably
+    persisted. Callers that track "every log below this point is stored" may
+    advance past it; only a failure to persist may stall them.
+    """
+
+
+# Kept separate so the terminal-state migration can rebuild exactly this table.
+TELEGRAM_OUTBOX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS telegram_outbox (
+    event_id TEXT NOT NULL,
+    ruleset_version TEXT NOT NULL,
+    feature_version TEXT NOT NULL,
+    evaluated_at_ms INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','sent','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at_ms INTEGER NOT NULL,
+    last_error TEXT,
+    message_text TEXT NOT NULL,
+    sent_at_ms INTEGER,
+    failed_at_ms INTEGER,
+    PRIMARY KEY (event_id, ruleset_version, feature_version),
+    FOREIGN KEY (event_id, ruleset_version, feature_version, evaluated_at_ms)
+      REFERENCES decisions(event_id, ruleset_version, feature_version, evaluated_at_ms)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_outbox_due
+  ON telegram_outbox(state, next_attempt_at_ms);
+"""
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -56,21 +90,6 @@ CREATE TABLE IF NOT EXISTS decisions (
     delivery TEXT NOT NULL CHECK (delivery IN ('strong','medium','weak','suppress')),
     decision_json TEXT NOT NULL,
     PRIMARY KEY (event_id, ruleset_version, feature_version, evaluated_at_ms)
-);
-CREATE TABLE IF NOT EXISTS telegram_outbox (
-    event_id TEXT NOT NULL,
-    ruleset_version TEXT NOT NULL,
-    feature_version TEXT NOT NULL,
-    evaluated_at_ms INTEGER NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('pending','sent')),
-    attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at_ms INTEGER NOT NULL,
-    last_error TEXT,
-    message_text TEXT NOT NULL,
-    sent_at_ms INTEGER,
-    PRIMARY KEY (event_id, ruleset_version, feature_version),
-    FOREIGN KEY (event_id, ruleset_version, feature_version, evaluated_at_ms)
-      REFERENCES decisions(event_id, ruleset_version, feature_version, evaluated_at_ms)
 );
 CREATE TABLE IF NOT EXISTS telegram_delivery_claims (
     dedupe_key TEXT PRIMARY KEY,
@@ -135,8 +154,6 @@ CREATE INDEX IF NOT EXISTS idx_events_seed_reconcile
                   token_created_at_ms, event_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_delivery
   ON decisions(delivery, evaluated_at_ms);
-CREATE INDEX IF NOT EXISTS idx_telegram_outbox_due
-  ON telegram_outbox(state, next_attempt_at_ms);
 CREATE INDEX IF NOT EXISTS idx_enrichment_jobs_due
   ON enrichment_jobs(state, due_at_ms, priority_score DESC);
 """
@@ -158,12 +175,55 @@ def connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _migrate_telegram_outbox_terminal_state(
+    connection: sqlite3.Connection,
+) -> bool:
+    """Give ``telegram_outbox`` a ``failed`` terminal state.
+
+    SQLite cannot widen a CHECK constraint in place, so an existing table is
+    rebuilt. The migration is idempotent: it inspects the stored DDL and is a
+    no-op once the terminal state is present.
+    """
+    row = connection.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type='table' AND name='telegram_outbox'
+        """
+    ).fetchone()
+    if row is None or "'failed'" in str(row["sql"] or ""):
+        return False
+    columns = (
+        "event_id, ruleset_version, feature_version, evaluated_at_ms, "
+        "state, attempts, next_attempt_at_ms, last_error, message_text, "
+        "sent_at_ms"
+    )
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with connection:
+            connection.execute(
+                "ALTER TABLE telegram_outbox RENAME TO telegram_outbox_pre_failed"
+            )
+            connection.executescript(TELEGRAM_OUTBOX_SCHEMA)
+            connection.execute(
+                "INSERT INTO telegram_outbox (%s) SELECT %s "
+                "FROM telegram_outbox_pre_failed" % (columns, columns)
+            )
+            connection.execute("DROP TABLE telegram_outbox_pre_failed")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchone()
+        if violations is not None:
+            raise RuntimeError("telegram outbox migration broke references")
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+    return True
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     current = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if current < 0 or current > SCHEMA_VERSION:
         raise RuntimeError("unsupported database schema")
     with connection:
         connection.executescript(SCHEMA)
+        connection.executescript(TELEGRAM_OUTBOX_SCHEMA)
         connection.execute(
             """
             UPDATE enrichment_jobs
@@ -172,6 +232,7 @@ def initialize(connection: sqlite3.Connection) -> None:
             """
         )
         connection.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+    _migrate_telegram_outbox_terminal_state(connection)
 
 
 def store_raw_payload(
@@ -254,7 +315,7 @@ def store_event(connection: sqlite3.Connection, event: RadarEvent) -> bool:
                 existing_value.pop(key, None)
                 incoming_value.pop(key, None)
             if existing_value != incoming_value:
-                raise RuntimeError("conflicting event identity")
+                raise EventIdentityConflict("conflicting event identity")
             return False
         cursor = connection.execute(
             """
@@ -425,6 +486,38 @@ def schedule_enrichment_job(
             if tuple(existing) != immutable:
                 raise RuntimeError("conflicting enrichment job identity")
             return False
+        active = connection.execute(
+            """
+            SELECT j.event_id,j.priority_score,j.state
+            FROM enrichment_jobs j
+            JOIN radar_events e ON e.event_id=j.event_id
+            WHERE j.priority_version=? AND j.state IN ('pending','processing')
+              AND e.chain=? AND e.token_address=?
+            ORDER BY CASE j.state WHEN 'processing' THEN 0 ELSE 1 END,
+                     j.priority_score DESC
+            LIMIT 1
+            """,
+            (priority_version, event.chain, event.token_address),
+        ).fetchone()
+        if active is not None:
+            if (
+                active["state"] == "pending"
+                and priority_score > int(active["priority_score"])
+            ):
+                connection.execute(
+                    """
+                    UPDATE enrichment_jobs
+                    SET state='done',result_code='TOKEN_COALESCED',updated_at_ms=?
+                    WHERE event_id=? AND priority_version=? AND state='pending'
+                    """,
+                    (
+                        event.received_at_ms,
+                        active["event_id"],
+                        priority_version,
+                    ),
+                )
+            else:
+                return False
         cursor = connection.execute(
             """
             INSERT INTO enrichment_jobs
@@ -444,6 +537,8 @@ def claim_due_enrichment(
     now_ms: int,
     initial_available: bool = True,
     initial_chains: tuple = ("bsc", "base", "robinhood"),
+    size_recheck_available: bool = True,
+    dex_recheck_available: bool = True,
     dex_available: bool = True,
     goplus_available: bool = True,
 ) -> Optional[Dict[str, Any]]:
@@ -464,13 +559,13 @@ def claim_due_enrichment(
             WHERE j.state='pending' AND j.due_at_ms <= ?
               AND j.expires_at_ms > ?
               AND ((j.stage='security_check' AND ?)
-                   OR (j.stage='dex_recheck' AND ?)
+                   OR (j.stage='dex_recheck' AND ? AND ?)
                    OR (j.stage='dex_probe' AND (
                        EXISTS (
                          SELECT 1 FROM provider_observations p
                          WHERE p.event_id=j.event_id
                            AND p.provider='gmgn_size'
-                       )
+                       ) AND ?
                        OR (? AND ?
                            AND ((e.chain='bsc' AND ?)
                                 OR (e.chain='base' AND ?)
@@ -488,6 +583,8 @@ def claim_due_enrichment(
                 now_ms,
                 int(goplus_available),
                 int(dex_available),
+                int(dex_recheck_available),
+                int(size_recheck_available),
                 int(dex_available),
                 int(initial_available),
                 int("bsc" in initial_chains),
@@ -513,6 +610,24 @@ def claim_due_enrichment(
         json.loads(result["priority_reasons_json"])
     )
     return result
+
+
+def enrichment_queue_under_pressure(
+    connection: sqlite3.Connection,
+    *,
+    threshold: int = 100,
+) -> bool:
+    if threshold <= 0:
+        raise ValueError("invalid enrichment pressure threshold")
+    row = connection.execute(
+        """
+        SELECT COUNT(*) FROM (
+          SELECT 1 FROM enrichment_jobs WHERE state='pending' LIMIT ?
+        )
+        """,
+        (threshold,),
+    ).fetchone()
+    return int(row[0]) >= threshold
 
 
 def reschedule_enrichment_job(
@@ -722,6 +837,15 @@ def claim_due_telegram(
     if max_attempts < 1:
         raise ValueError("invalid Telegram max attempts")
     with connection:
+        connection.execute(
+            """
+            UPDATE telegram_outbox
+            SET state='failed', failed_at_ms=?,
+                last_error=COALESCE(last_error, 'MAX_ATTEMPTS_EXHAUSTED')
+            WHERE state='pending' AND attempts >= ?
+            """,
+            (now_ms, max_attempts),
+        )
         row = connection.execute(
             """
             SELECT event_id, ruleset_version, feature_version, evaluated_at_ms,
@@ -808,8 +932,39 @@ def mark_telegram_retry(
             raise RuntimeError("Telegram outbox item is not pending")
 
 
+def mark_telegram_failed(
+    connection: sqlite3.Connection,
+    item: Dict[str, Any],
+    *,
+    failed_at_ms: int,
+    error_code: str,
+) -> None:
+    """Retire a pending item permanently, without waiting for more retries."""
+    safe_error = str(error_code)[:128]
+    if not safe_error:
+        raise ValueError("Telegram failure error required")
+    with connection:
+        cursor = connection.execute(
+            """
+            UPDATE telegram_outbox
+            SET state='failed', failed_at_ms=?, last_error=?
+            WHERE event_id=? AND ruleset_version=? AND feature_version=?
+              AND state='pending'
+            """,
+            (
+                failed_at_ms,
+                safe_error,
+                item["event_id"],
+                item["ruleset_version"],
+                item["feature_version"],
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Telegram outbox item is not pending")
+
+
 def telegram_outbox_counts(connection: sqlite3.Connection) -> Dict[str, int]:
-    counts = {"pending": 0, "sent": 0}
+    counts = {"pending": 0, "sent": 0, "failed": 0}
     for row in connection.execute(
         "SELECT state, COUNT(*) AS count FROM telegram_outbox GROUP BY state"
     ):

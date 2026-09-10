@@ -1,5 +1,7 @@
 import asyncio
+import sqlite3
 import tempfile
+import time
 import unittest
 from collections import Counter
 from dataclasses import replace
@@ -23,7 +25,11 @@ from meme_radar.sources import (
     MarketSnapshot,
     ProviderApiError,
 )
-from meme_radar.storage import claim_due_enrichment
+from meme_radar.storage import (
+    EventIdentityConflict,
+    claim_due_enrichment,
+    get_runtime_state,
+)
 
 from support import load_fixture
 
@@ -120,19 +126,206 @@ class DaemonTests(unittest.TestCase):
             daemon.counters["native_rpc_robinhood_block_timestamp_retries"],
         )
 
+    def test_backfill_holds_checkpoint_at_the_first_unprocessed_block(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(
+                Path(temp),
+                bitquery_enabled=False,
+                native_rpc_mode="primary",
+            )
+            spec = NATIVE_SPECS["base"]
+            client = SimpleNamespace(
+                chain_id=lambda: spec.chain_id,
+                block_number=lambda: 0x20,
+            )
+            daemon.native_http["base"] = (client,)
+            logs = [self.native_log(tx_char="c", log_index="0x1")]
+            daemon.process_native_log_safe = AsyncMock(return_value=False)
+            with patch(
+                "meme_radar.daemon.get_logs_with_413_split",
+                return_value=(logs, 0),
+            ):
+                asyncio.get_event_loop().run_until_complete(
+                    daemon.native_backfill("base")
+                )
+            checkpoint = get_runtime_state(
+                daemon.connection,
+                daemon.native_checkpoint_key("base"),
+            )
+            self.assertIsNone(checkpoint)
+            hold = daemon.native_checkpoint_hold["base"]
+            self.assertEqual(0x10, hold["block"])
+            self.assertEqual(1, daemon.counters["native_rpc_base_checkpoint_held"])
+            daemon.close()
+
+    def test_backfill_advances_and_releases_when_every_log_is_stored(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(
+                Path(temp),
+                bitquery_enabled=False,
+                native_rpc_mode="primary",
+            )
+            spec = NATIVE_SPECS["base"]
+            client = SimpleNamespace(
+                chain_id=lambda: spec.chain_id,
+                block_number=lambda: 0x20,
+            )
+            daemon.native_http["base"] = (client,)
+            daemon.native_checkpoint_hold["base"] = {
+                "block": 0x10,
+                "holds": 1,
+                "since_ms": NOW,
+                "updated_at_ms": NOW,
+            }
+            daemon.process_native_log_safe = AsyncMock(return_value=True)
+            with patch(
+                "meme_radar.daemon.get_logs_with_413_split",
+                return_value=([self.native_log()], 0),
+            ):
+                asyncio.get_event_loop().run_until_complete(
+                    daemon.native_backfill("base")
+                )
+            self.assertEqual(
+                0x20,
+                get_runtime_state(
+                    daemon.connection,
+                    daemon.native_checkpoint_key("base"),
+                ),
+            )
+            self.assertNotIn("base", daemon.native_checkpoint_hold)
+            self.assertEqual(
+                1,
+                daemon.counters["native_rpc_base_checkpoint_released"],
+            )
+            daemon.close()
+
+    def test_live_log_that_fails_processing_does_not_advance_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(
+                Path(temp),
+                bitquery_enabled=False,
+                native_rpc_mode="primary",
+            )
+            daemon.native_backfill = AsyncMock()
+            daemon.process_native_log_safe = AsyncMock(return_value=False)
+
+            async def stream(**kwargs):
+                yield self.native_log()
+                daemon.stop_event.set()
+
+            with patch(
+                "meme_radar.daemon.stream_native_logs_once",
+                new=stream,
+            ):
+                asyncio.get_event_loop().run_until_complete(
+                    daemon.native_rpc_loop("base")
+                )
+            self.assertIsNone(
+                get_runtime_state(
+                    daemon.connection,
+                    daemon.native_checkpoint_key("base"),
+                )
+            )
+            self.assertEqual(
+                0x10,
+                daemon.native_checkpoint_hold["base"]["block"],
+            )
+            daemon.close()
+
+    def test_live_log_advances_checkpoint_only_while_not_held(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(
+                Path(temp),
+                bitquery_enabled=False,
+                native_rpc_mode="primary",
+            )
+            daemon.native_backfill = AsyncMock()
+            daemon.process_native_log_safe = AsyncMock(return_value=True)
+            daemon.native_checkpoint_hold["base"] = {
+                "block": 0x08,
+                "holds": 1,
+                "since_ms": NOW,
+                "updated_at_ms": NOW,
+            }
+
+            async def stream(**kwargs):
+                yield self.native_log()
+                daemon.stop_event.set()
+
+            with patch(
+                "meme_radar.daemon.stream_native_logs_once",
+                new=stream,
+            ):
+                asyncio.get_event_loop().run_until_complete(
+                    daemon.native_rpc_loop("base")
+                )
+            self.assertIsNone(
+                get_runtime_state(
+                    daemon.connection,
+                    daemon.native_checkpoint_key("base"),
+                )
+            )
+            daemon.close()
+
+    def test_unparseable_failed_log_holds_the_batch_lower_bound(self):
+        daemon = RadarDaemon.__new__(RadarDaemon)
+        daemon.counters = Counter()
+        daemon.native_checkpoint_hold = {}
+        daemon.hold_native_checkpoint("bsc", 41)
+        daemon.hold_native_checkpoint("bsc", 41)
+        self.assertEqual(2, daemon.native_checkpoint_hold["bsc"]["holds"])
+        daemon.hold_native_checkpoint("bsc", 12)
+        self.assertEqual(12, daemon.native_checkpoint_hold["bsc"]["block"])
+        self.assertEqual(1, daemon.native_checkpoint_hold["bsc"]["holds"])
+
+    def test_token_metadata_failure_is_counted_not_silent(self):
+        daemon = RadarDaemon.__new__(RadarDaemon)
+        daemon.counters = Counter()
+        daemon.last_error = {}
+        daemon.record_token_metadata_error("symbol", "RpcError")
+        self.assertEqual(
+            1,
+            daemon.counters["native_token_metadata_error_symbol"],
+        )
+        self.assertEqual(
+            "RpcError",
+            daemon.last_error["native_token_metadata_symbol"]["type"],
+        )
+
     def test_native_processing_error_does_not_trigger_rpc_failover(self):
         daemon = RadarDaemon.__new__(RadarDaemon)
         daemon.counters = Counter()
         daemon.last_error = {}
         daemon.process_native_log = AsyncMock(
-            side_effect=RuntimeError("conflicting event identity")
+            side_effect=sqlite3.OperationalError("disk I/O error")
         )
         result = asyncio.get_event_loop().run_until_complete(
             daemon.process_native_log_safe("bsc", {}, is_backfill=True)
         )
         self.assertFalse(result)
         self.assertEqual(1, daemon.counters["native_rpc_bsc_processing_rejected"])
-        self.assertEqual("RuntimeError", daemon.last_error["native_processing_bsc"]["type"])
+        self.assertEqual(
+            "OperationalError",
+            daemon.last_error["native_processing_bsc"]["type"],
+        )
+
+    def test_a_duplicate_launch_never_holds_the_checkpoint(self):
+        """The same log arrives live and via backfill, and only the live path
+        fetches name and symbol, so storage refuses the second rendering. The
+        event is stored either way, so the checkpoint must keep moving."""
+        daemon = RadarDaemon.__new__(RadarDaemon)
+        daemon.counters = Counter()
+        daemon.last_error = {}
+        daemon.process_native_log = AsyncMock(
+            side_effect=EventIdentityConflict("conflicting event identity")
+        )
+        result = asyncio.get_event_loop().run_until_complete(
+            daemon.process_native_log_safe("bsc", {}, is_backfill=True)
+        )
+        self.assertTrue(result)
+        self.assertEqual(1, daemon.counters["native_rpc_bsc_identity_conflict"])
+        self.assertEqual(0, daemon.counters["native_rpc_bsc_processing_rejected"])
+        self.assertNotIn("native_processing_bsc", daemon.last_error)
 
     def test_native_rpc_error_still_reaches_failover_handler(self):
         daemon = RadarDaemon.__new__(RadarDaemon)
@@ -638,7 +831,7 @@ class DaemonTests(unittest.TestCase):
             self.assertEqual(expected, due_at_ms)
             budget = daemon.initial_probe_budget.snapshot()
             self.assertEqual(
-                (14, 3_600),
+                (20, 3_600),
                 (budget["limit"], budget["window_seconds"]),
             )
             daemon.close()
@@ -665,6 +858,125 @@ class DaemonTests(unittest.TestCase):
             self.assertIsNone(
                 daemon.next_size_check_ms(event, NOW + 30 * 60_000)
             )
+            daemon.close()
+
+    def test_size_rechecks_stop_far_below_floor_and_reduce_mid_band(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(Path(temp))
+            event = SimpleNamespace(
+                token_created_at_ms=NOW,
+                received_at_ms=NOW,
+            )
+            base = dict(
+                chain="base",
+                token_address="0x" + "1" * 40,
+                observed_at_ms=NOW + 5 * 60_000,
+                price_usd=0.001,
+                liquidity_usd=10_000,
+                bytes_read=100,
+                elapsed_ms=10,
+            )
+            far = GmgnTokenInfoSnapshot(
+                holder_count=10,
+                market_cap_usd=10_000,
+                **base,
+            )
+            mid = GmgnTokenInfoSnapshot(
+                holder_count=40,
+                market_cap_usd=40_000,
+                **base,
+            )
+            self.assertIsNone(
+                daemon.next_size_check_ms(event, NOW + 5 * 60_000, far)
+            )
+            self.assertEqual(
+                NOW + 10 * 60_000,
+                daemon.next_size_check_ms(event, NOW + 5 * 60_000, mid),
+            )
+            self.assertEqual(
+                NOW + 20 * 60_000,
+                daemon.next_size_check_ms(event, NOW + 10 * 60_000, mid),
+            )
+            self.assertIsNone(
+                daemon.next_size_check_ms(event, NOW + 20 * 60_000, mid)
+            )
+            daemon.close()
+
+    def test_gmgn_budget_is_split_between_initial_and_size_rechecks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(Path(temp), gmgn_enabled=True)
+            self.assertEqual(120, daemon.initial_probe_budget.snapshot()["limit"])
+            self.assertEqual(60, daemon.size_recheck_budget.snapshot()["limit"])
+            self.assertEqual(
+                {"bsc": 80, "base": 30, "robinhood": 10},
+                {
+                    chain: budget.snapshot()["limit"]
+                    for chain, budget in daemon.initial_chain_budgets.items()
+                },
+            )
+            daemon.close()
+
+    def test_gmgn_calls_are_paced_and_cooldown_is_shared(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(Path(temp), gmgn_enabled=True)
+            daemon.gmgn_next_call_at = time.monotonic() + 1.0
+            with patch(
+                "meme_radar.daemon.asyncio.sleep",
+                new=AsyncMock(),
+            ) as sleep:
+                result = asyncio.get_event_loop().run_until_complete(
+                    daemon.run_gmgn_call(lambda value: value, "ok")
+                )
+            self.assertEqual("ok", result)
+            self.assertEqual(1, sleep.await_count)
+            self.assertGreater(sleep.await_args.args[0], 0.5)
+            self.assertGreater(
+                daemon.gmgn_next_call_at,
+                time.monotonic(),
+            )
+            daemon.cooldown_all_gmgn(60)
+            self.assertGreater(
+                daemon.gmgn_budget.snapshot()["cooldown_seconds"],
+                0,
+            )
+            self.assertGreater(
+                daemon.gmgn_discovery_budget.snapshot()["cooldown_seconds"],
+                0,
+            )
+            daemon.close()
+
+    def test_pressure_admission_keeps_high_and_drops_plain_medium(self):
+        with tempfile.TemporaryDirectory() as temp:
+            daemon = self.make_daemon(Path(temp))
+            event = SimpleNamespace(
+                event_id="event",
+                source="native_rpc",
+                token_created_at_ms=NOW,
+                received_at_ms=NOW,
+            )
+            features = SimpleNamespace(event_id="event")
+            with patch(
+                "meme_radar.daemon.enrichment_queue_under_pressure",
+                return_value=True,
+            ), patch("meme_radar.daemon.schedule_enrichment_job") as schedule:
+                daemon.priority_tracker = SimpleNamespace(
+                    score=lambda *_args: SimpleNamespace(
+                        score=49,
+                        reason_codes=("SOURCE_FRESH_30",),
+                    )
+                )
+                daemon.schedule_candidate(event, features)
+                schedule.assert_not_called()
+                daemon.priority_tracker = SimpleNamespace(
+                    score=lambda *_args: SimpleNamespace(
+                        score=65,
+                        reason_codes=("SOURCE_FRESH_30",),
+                    )
+                )
+                schedule.return_value = True
+                daemon.schedule_candidate(event, features)
+                schedule.assert_called_once()
+            self.assertEqual(1, daemon.counters["priority_admission_pressure"])
             daemon.close()
 
     def test_gmgn_solana_growth_candidate_reaches_strong_outbox(self):

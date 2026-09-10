@@ -47,6 +47,7 @@ class MarketSnapshot:
     identity_market_cap_rank: Optional[int] = None
     external_buy_transactions_5m: Optional[int] = None
     holder_count: Optional[int] = None
+    base_pair_count: int = 0
 
 
 def _number(value: Any) -> Optional[float]:
@@ -87,28 +88,38 @@ class DexScreenerSource:
         if not isinstance(pairs, list):
             raise RuntimeError("DexScreener pairs invalid")
         rows: List[Dict[str, Any]] = []
+        base_rows: List[Dict[str, Any]] = []
         for item in pairs[:400]:
             if not isinstance(item, dict):
                 continue
             if str(item.get("chainId", "")).lower() != DEX_CHAIN_IDS[normalized_chain]:
                 continue
-            related = set()
+            sides = {}
             for side in ("baseToken", "quoteToken"):
                 token = item.get(side)
                 value = token.get("address") if isinstance(token, dict) else None
                 if value:
                     try:
-                        related.add(normalize_address(normalized_chain, value))
+                        sides[side] = normalize_address(normalized_chain, value)
                     except ValueError:
                         continue
-            if address not in related:
+            if address not in sides.values():
                 continue
             rows.append(item)
-        rows.sort(
-            key=lambda item: _number((item.get("liquidity") or {}).get("usd")) or 0,
-            reverse=True,
-        )
-        best = rows[0] if rows else {}
+            if sides.get("baseToken") == address:
+                base_rows.append(item)
+        for bucket in (rows, base_rows):
+            bucket.sort(
+                key=lambda item: _number((item.get("liquidity") or {}).get("usd")) or 0,
+                reverse=True,
+            )
+        # priceUsd, marketCap and fdv in the DexScreener payload always describe
+        # the pair's baseToken. Reading them off a pair where the requested
+        # token is the quote asset reports another token's price as this one's,
+        # so only base-side pairs may supply them. A token that never appears as
+        # a base asset has no price here -- which is null, not zero, and every
+        # downstream gate treats null as blocking.
+        best = base_rows[0] if base_rows else {}
         return MarketSnapshot(
             chain=normalized_chain,
             token_address=address,
@@ -143,4 +154,5 @@ class DexScreenerSource:
             elapsed_ms=response.elapsed_ms,
             market_cap_usd=_number(best.get("marketCap")),
             fdv_usd=_number(best.get("fdv")),
+            base_pair_count=len(base_rows),
         )

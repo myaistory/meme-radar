@@ -462,6 +462,70 @@ class SourceClientTests(unittest.TestCase):
         )
         self.assertEqual(0, snapshot.pair_count)
 
+    def test_dexscreener_never_reports_a_quote_side_pair_price(self):
+        """priceUsd describes the pair's baseToken, never the quote asset."""
+        token = "0x1111111111111111111111111111111111111111"
+        url = "https://api.dexscreener.com/latest/dex/tokens/" + token
+        payload = {
+            "pairs": [
+                {
+                    # Deepest pair, but the requested token is the quote asset,
+                    # so its priceUsd belongs to 0x2222..., not to the token.
+                    "chainId": "bsc",
+                    "baseToken": {"address": "0x2222222222222222222222222222222222222222"},
+                    "quoteToken": {"address": token},
+                    "pairAddress": "quote-side",
+                    "priceUsd": "0.004",
+                    "marketCap": "1500000000",
+                    "liquidity": {"usd": 999999},
+                },
+                {
+                    "chainId": "bsc",
+                    "baseToken": {"address": token},
+                    "quoteToken": {"address": "0x3333333333333333333333333333333333333333"},
+                    "pairAddress": "base-side",
+                    "priceUsd": "1.0002",
+                    "marketCap": "60000000",
+                    "liquidity": {"usd": 100},
+                },
+            ]
+        }
+        snapshot = DexScreenerSource(FakeTransport({url: payload})).token_market(
+            "bsc", token
+        )
+        self.assertEqual(2, snapshot.pair_count)
+        self.assertEqual(1, snapshot.base_pair_count)
+        self.assertEqual("base-side", snapshot.best_pair_address)
+        self.assertEqual(1.0002, snapshot.price_usd)
+        self.assertEqual(60_000_000.0, snapshot.market_cap_usd)
+        self.assertEqual(100.0, snapshot.liquidity_usd)
+
+    def test_dexscreener_quote_only_token_has_no_price(self):
+        """Null, not another token's price: every gate treats null as blocking."""
+        token = "0x1111111111111111111111111111111111111111"
+        url = "https://api.dexscreener.com/latest/dex/tokens/" + token
+        payload = {
+            "pairs": [
+                {
+                    "chainId": "bsc",
+                    "baseToken": {"address": "0x2222222222222222222222222222222222222222"},
+                    "quoteToken": {"address": token},
+                    "pairAddress": "quote-only",
+                    "priceUsd": "0.004",
+                    "marketCap": "1500000000",
+                    "liquidity": {"usd": 999999},
+                }
+            ]
+        }
+        snapshot = DexScreenerSource(FakeTransport({url: payload})).token_market(
+            "bsc", token
+        )
+        self.assertEqual(1, snapshot.pair_count)
+        self.assertEqual(0, snapshot.base_pair_count)
+        self.assertIsNone(snapshot.price_usd)
+        self.assertIsNone(snapshot.market_cap_usd)
+        self.assertEqual("", snapshot.best_pair_address)
+
 
 if __name__ == "__main__":
     unittest.main()

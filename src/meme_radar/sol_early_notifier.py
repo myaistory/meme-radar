@@ -8,6 +8,7 @@ import json
 import os
 import re
 import signal
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -121,6 +122,21 @@ def _money(value: float) -> str:
     return "$%.0f" % value
 
 
+def _env_int(name: str, default: int) -> int:
+    """Integer environment setting with an explicit boundary error.
+
+    A bare ``int()`` here turns a typo in the unit file into a ValueError with
+    no indication of which setting was wrong.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError("invalid integer for %s" % name) from None
+
+
 def _telegram(env_file: Path, enabled: bool) -> Optional[TelegramClient]:
     if not enabled:
         return None
@@ -164,9 +180,10 @@ class SolEarlyNotifier:
             raise ValueError("invalid Sol early Telegram flag")
         self.telegram_enabled = flag == "1" and not dry_run
         self.telegram = _telegram(telegram_env, self.telegram_enabled)
-        poll = int(os.environ.get("MEME_RADAR_SOL_EARLY_POLL_SECONDS", "2"))
-        provider_calls = int(
-            os.environ.get("MEME_RADAR_SOL_EARLY_PROVIDER_CALLS_PER_HOUR", "24")
+        poll = _env_int("MEME_RADAR_SOL_EARLY_POLL_SECONDS", 2)
+        provider_calls = _env_int(
+            "MEME_RADAR_SOL_EARLY_PROVIDER_CALLS_PER_HOUR",
+            24,
         )
         if not 1 <= poll <= 30 or not 3 <= provider_calls <= 120:
             raise ValueError("invalid Sol early runtime limits")
@@ -806,11 +823,10 @@ def main() -> int:
                 },
                 sort_keys=True,
             ),
-            file=os.sys.stderr,
+            file=sys.stderr,
         )
         return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    finish_candidate,

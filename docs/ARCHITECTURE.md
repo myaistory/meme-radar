@@ -33,6 +33,8 @@ flowchart TB
     N --> D
     S --> D
     U --> D
+    D --> L[Outcome Cohort]
+    L --> M[T+1m / 5m / 15m / 1h / 6h / 24h]
     H --> T
 ```
 
@@ -74,3 +76,4 @@ SQLite保存：
 - `meme-radar-pons-curve-notifier`：Robinhood独立门控通知。
 - `meme-radar-sol-early`：Solana早期多类型确认。
 - `meme-radar-health-alert`：数据源与队列健康告警。
+- outcome collector/report：只读评估已交付、已拒绝和抽样未评估候选的后续表现，不反向改变实时评分。
