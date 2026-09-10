@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meme-radar"
+version = "0.1.0"
+description = "Read-only multi-chain meme signal radar"
+requires-python = ">=3.9"
+dependencies = ["websockets>=15,<16"]
+
+[project.scripts]
+meme-radar = "meme_radar.daemon:main"
+meme-radar-pons-curve-shadow = "meme_radar.pons_curve_shadow:main"
+meme-radar-pons-curve-notifier = "meme_radar.pons_curve_notifier:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

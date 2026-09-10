@@ -1,0 +1,130 @@
+{
+  "schema_version": "sol_early_information_policy_v1",
+  "policy_version": "sol_early_v1",
+  "status": "deployed_information_only_2026-09-09",
+  "purpose": "High-confidence early Solana information for a dedicated Telegram destination; never a trading instruction.",
+  "source": {
+    "schema_version": "gmgnsignals_fast_event_v0",
+    "chain": "solana",
+    "require_non_backfill": true,
+    "max_posted_to_seen_ms": 15000,
+    "max_signal_age_ms": 60000,
+    "max_future_skew_ms": 5000,
+    "max_token_age_minutes": 120,
+    "edits_add_independent_evidence": false
+  },
+  "discovery_gate": {
+    "min_market_cap_usd": 10000,
+    "max_market_cap_usd": 100000,
+    "min_liquidity_usd": 5000,
+    "max_top10_percent": 0.4,
+    "allowed_card_types": [
+      "CTO Update",
+      "Dex Paid Update",
+      "FDV Surge",
+      "KOL Buy",
+      "KOTH",
+      "Research"
+    ],
+    "single_card_action": "store_watch_only_no_push"
+  },
+  "confirmed_gate": {
+    "rolling_window_minutes": 5,
+    "min_safe_events": 2,
+    "min_unique_card_types": 2,
+    "min_market_cap_usd": 10000,
+    "max_market_cap_usd": 100000,
+    "min_liquidity_usd": 5000,
+    "max_top10_percent": 0.4,
+    "min_total_fee_sol": 1.0,
+    "max_total_fee_sol": 10.0,
+    "total_fee_semantics": "gmgn_cumulative_signal_metric_not_realized_trading_cost",
+    "allowed_card_combinations": [
+      "CTO Update+Dex Paid Update+KOL Buy+Research",
+      "CTO Update+Dex Paid Update+KOTH",
+      "CTO Update+Dex Paid Update+Research",
+      "CTO Update+FDV Surge+KOL Buy+KOTH",
+      "Dex Paid Update+KOTH",
+      "FDV Surge+KOL Buy",
+      "FDV Surge+KOL Buy+KOTH",
+      "FDV Surge+KOL Buy+Research",
+      "FDV Surge+KOTH",
+      "FDV Surge+KOTH+Research",
+      "KOL Buy+KOTH",
+      "KOL Buy+Research"
+    ],
+    "combination_semantics": "interpretable_historical_allowlist_not_oos_alpha_proof"
+  },
+  "quality_tiers": {
+    "experimental_preference": {
+      "min_market_cap_usd": 18000,
+      "max_market_cap_usd": 70000,
+      "min_liquidity_usd": 11000,
+      "max_top10_percent": 0.29,
+      "min_total_fee_sol": 1.2,
+      "max_total_fee_sol": 8.5
+    },
+    "balanced_preference": {
+      "min_market_cap_usd": 22000,
+      "max_market_cap_usd": 60000,
+      "min_liquidity_usd": 13000,
+      "max_top10_percent": 0.27,
+      "min_total_fee_sol": 1.5,
+      "max_total_fee_sol": 8.0
+    },
+    "tiers_change_delivery_eligibility": false
+  },
+  "safety_gate": {
+    "identity_binding": ["chain", "token_address"],
+    "gmgn_evidence_max_age_ms": 60000,
+    "dex_evidence_max_age_ms": 60000,
+    "dex_activity_window_minutes": 5,
+    "required_risk_level": "normal",
+    "is_honeypot": false,
+    "is_blacklisted": false,
+    "dev_sold_card_in_window_action": "block",
+    "dev_sold_all_action": "block",
+    "required_risk_ratios": [
+      "rug_ratio",
+      "bundler_rate",
+      "insider_rate",
+      "entrapment_ratio",
+      "dev_team_hold_rate"
+    ],
+    "max_risk_ratio": 0.3,
+    "renounced_mint": true,
+    "renounced_freeze": true,
+    "require_fresh_dex_pair": true,
+    "require_observed_dex_buy": true,
+    "require_observed_dex_sell": true,
+    "observed_dex_sell_is_not_a_current_execution_guarantee": true,
+    "missing_required_evidence_action": "store_watch_only_no_push"
+  },
+  "delivery": {
+    "label": "SOL-EARLY-CONFIRMED",
+    "dedupe_scope": "policy_chain_token",
+    "rate_limit_enabled": false,
+    "max_messages_per_hour": null,
+    "max_messages_per_day": null,
+    "backfill_push": false,
+    "repeat_push": false,
+    "allow_one_material_evidence_upgrade": false,
+    "telegram_destination": "secure_vps_env_configured"
+  },
+  "outcomes": {
+    "required_horizons_minutes": [1, 5, 15, 60],
+    "unavailable_is_not_zero": true,
+    "future_frozen_cohort_required": true
+  },
+  "claims": {
+    "historical_pre_fee_pre_safety_capacity_measured": true,
+    "historical_final_gate_frequency_measured": false,
+    "precise_card_combinations_validated_out_of_sample": false,
+    "historical_incremental_alpha_proven": false,
+    "profitability_claim_allowed": false,
+    "trading_instruction": false,
+    "signing": false,
+    "broadcast": false,
+    "live_trading": false
+  }
+}

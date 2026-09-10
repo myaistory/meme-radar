@@ -1,0 +1,30 @@
+{
+  "EVM": {
+    "Events": [
+      {
+        "Block": {"Time": "2026-09-04T10:00:00Z"},
+        "Transaction": {
+          "Hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "From": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "Arguments": [
+          {"Name": "token", "Value": {"address": "0x1111111111111111111111111111111111111111"}},
+          {"Name": "name", "Value": {"string": "Bull Run"}},
+          {"Name": "symbol", "Value": {"string": "BULL"}}
+        ]
+      },
+      {
+        "Block": {"Time": "2026-09-04T10:00:01Z"},
+        "Transaction": {
+          "Hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "From": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "Arguments": [
+          {"Name": "token", "Value": {"address": "0x2222222222222222222222222222222222222222"}},
+          {"Name": "name", "Value": {"string": "牛来"}},
+          {"Name": "symbol", "Value": {"string": "NIULAI"}}
+        ]
+      }
+    ]
+  }
+}

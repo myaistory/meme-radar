@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+
+GMGN_CLI_BIN="${GMGN_CLI_BIN:-gmgn-cli}"
+
+if ! command -v "$GMGN_CLI_BIN" >/dev/null 2>&1; then
+  echo "[gmgn-cli] configured executable is missing" >&2
+  exit 127
+fi
+
+umask 077
+unset GMGN_PRIVATE_KEY
+unset GMGN_ALLOW_AUTOMATED_TRADES
+unset GMGN_DEBUG
+export GMGN_RATE_LIMIT_AUTO_RETRY_MAX_WAIT_MS=0
+
+case "${1-}" in
+  ""|--help|-h)
+    cat <<'EOF'
+Usage: gmgn-cli <token|market|portfolio|track|config> [options]
+
+Meme Radar safety profile: read-only GMGN access.
+Allowed config operations: `config` and `config --check`.
+API-key apply, swaps, orders, token creation, and automated execution are blocked.
+EOF
+    exit 0
+    ;;
+  --version|-V|token|market|portfolio|track)
+    ;;
+  config)
+    if [ "$#" -eq 1 ]; then
+      :
+    elif [ "$#" -eq 2 ] && [ "${2-}" = "--check" ]; then
+      :
+    else
+      echo "[gmgn-cli] blocked: only 'config' and 'config --check' are allowed" >&2
+      exit 77
+    fi
+    ;;
+  *)
+    echo "[gmgn-cli] blocked by Meme Radar read-only policy: ${1-}" >&2
+    exit 77
+    ;;
+esac
+
+exec "$GMGN_CLI_BIN" "$@"

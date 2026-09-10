@@ -1,0 +1,25 @@
+{
+  "EVM": {
+    "Calls": [
+      {
+        "Block": {"Time": "2026-09-04T10:01:00Z"},
+        "Transaction": {
+          "Hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "From": "0xcccccccccccccccccccccccccccccccccccccccc"
+        },
+        "Call": {
+          "To": "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+          "Output": "0x00000000000000000000000033333333333333333333333333333333333333330000000000000000000000004444444444444444444444444444444444444444"
+        }
+      },
+      {
+        "Block": {"Time": "bad-time"},
+        "Transaction": {
+          "Hash": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "From": "0xdddddddddddddddddddddddddddddddddddddddd"
+        },
+        "Call": {"Output": "0x1234"}
+      }
+    ]
+  }
+}

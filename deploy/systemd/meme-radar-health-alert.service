@@ -1,0 +1,55 @@
+[Unit]
+Description=Meme Radar Telegram health alerts
+After=network-online.target meme-radar.service meme-radar-pons-curve-shadow.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=memeradar
+Group=memeradar
+WorkingDirectory=/opt/meme-radar/current
+Environment=PYTHONPATH=/opt/meme-radar/current/src
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/meme-radar/venv/bin/python -m meme_radar.health_alert --telegram-env /etc/meme-radar/telegram.env --main-health /var/lib/meme-radar/health.json --curve-health /var/lib/meme-radar/pons-curve-shadow/health.json --notifier-health /var/lib/meme-radar/pons-curve-notifier/health.json --state-path /var/lib/meme-radar/health-alert/state.json --health-path /var/lib/meme-radar/health-alert/health.json --poll-seconds 15 --alert-after-seconds 60 --cooldown-seconds 1800
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadOnlyPaths=/opt/meme-radar
+ReadOnlyPaths=/etc/meme-radar
+ReadOnlyPaths=/var/lib/meme-radar/health.json
+ReadOnlyPaths=/var/lib/meme-radar/pons-curve-shadow
+ReadOnlyPaths=/var/lib/meme-radar/pons-curve-notifier/health.json
+ReadWritePaths=/var/lib/meme-radar/health-alert
+
+MemoryAccounting=true
+MemoryHigh=64M
+MemoryMax=96M
+MemorySwapMax=0
+TasksMax=16
+LimitNOFILE=1024
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meme-radar-health-alert
+
+[Install]
+WantedBy=multi-user.target

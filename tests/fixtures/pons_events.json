@@ -1,0 +1,18 @@
+{
+  "EVM": {
+    "Events": [
+      {
+        "Block": {"Time": "2026-09-04T10:02:00Z"},
+        "Transaction": {
+          "Hash": "0xabababababababababababababababababababababababababababababababab",
+          "From": "0xabababababababababababababababababababab"
+        },
+        "Arguments": [
+          {"Name": "token", "Value": {"address": "0x3333333333333333333333333333333333333333"}},
+          {"Name": "creator", "Value": {"address": "0xabababababababababababababababababababab"}},
+          {"Name": "graduationThreshold", "Value": {"bigInteger": "4200000000000000000"}}
+        ]
+      }
+    ]
+  }
+}

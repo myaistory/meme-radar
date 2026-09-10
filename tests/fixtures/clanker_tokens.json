@@ -1,0 +1,30 @@
+{
+  "data": [
+    {
+      "id": 1,
+      "name": "Base Bull",
+      "symbol": "BBULL",
+      "contract_address": "0x6666666666666666666666666666666666666666",
+      "factory_address": "0xE85A59c628F7d27878ACeB4bf3b35733630083a9",
+      "msg_sender": "0x7777777777777777777777777777777777777777",
+      "tx_hash": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "created_at": "2026-09-04T11:00:00.000Z",
+      "deployed_at": "2026-09-04T11:00:00.000Z",
+      "type": "clanker_v4",
+      "warnings": []
+    },
+    {
+      "id": 2,
+      "name": "Wrong Factory",
+      "symbol": "WRONG",
+      "contract_address": "0x8888888888888888888888888888888888888888",
+      "factory_address": "0x9999999999999999999999999999999999999999",
+      "msg_sender": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tx_hash": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "deployed_at": "2026-09-04T11:00:01.000Z",
+      "type": "clanker_v4"
+    }
+  ],
+  "tokensDeployed": 2,
+  "total": 2
+}

@@ -1,0 +1,29 @@
+{
+  "available": true,
+  "count": 2,
+  "alerts": [
+    {
+      "id": "alert-1",
+      "eventId": "event-1",
+      "type": "buy",
+      "trader": "fixture-trader",
+      "token": "BULL",
+      "tokenAddress": "0x1111111111111111111111111111111111111111",
+      "chainId": 56,
+      "chain": "bsc",
+      "usdValue": 5000,
+      "ts": 1788516000000
+    },
+    {
+      "id": "alert-2",
+      "eventId": "event-2",
+      "type": "unknown-new-type",
+      "trader": "fixture-trader",
+      "token": "UNKNOWN",
+      "tokenAddress": "0x5555555555555555555555555555555555555555",
+      "chainId": 56,
+      "chain": "bsc",
+      "ts": 1788516001000
+    }
+  ]
+}
